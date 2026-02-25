@@ -1,0 +1,891 @@
+---
+title: "Collecting Data: Web, APIs, Open Sources"
+subtitle: "E1493 - Data Journalism"
+author: "Simon Munzert"
+institution: "Hertie School"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: false
+    theme: cosmo
+    code-fold: false
+    code-tools: true
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    highlight-style: github
+    embed-resources: true
+    link-external-newwindow: true
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| eval: true
+#| include: false
+#| label: load-packages
+  
+pkgs <- c("httr2", "jsonlite", "rvest", "tidyverse", "selenider")
+lapply(pkgs, library, character.only = TRUE)
+```
+
+::: {.callout-note}
+## Before you start
+
+Install the packages used in this workshop:
+
+```r
+install.packages(c("httr2", "jsonlite", "rvest", "tidyverse", "selenider"))
+
+# selenider needs a browser driver — run once:
+# For Chrome (default):
+selenider::install_selenider()           # installs chromedriver via wdman
+# For Firefox:
+selenider::install_selenider("firefox")  # installs geckodriver via wdman
+```
+
+You will also need **Google Chrome** or **Firefox** installed. Chrome is the default in this workshop; swap `browser = "firefox"` in the session setup if you prefer Firefox.
+:::
+
+---
+
+# Part 1: HTTP and httr2 Refresher {#http-refresher}
+
+Every time you load a webpage or call an API, your computer and a server are exchanging **HTTP messages**. Understanding the basics of those messages is the foundation for everything that follows.
+
+## The request–response cycle
+
+An HTTP interaction always follows the same pattern:
+
+1. Your code sends a **request** to a URL
+2. The server processes it and sends back a **response**
+3. The response has a **status code**, **headers**, and a **body**
+
+```
+Client                          Server
+  |                               |
+  |  GET /w/rest.php/v1/search    |
+  |  Host: en.wikipedia.org       |
+  |  Accept: application/json     |
+  | ----------------------------→ |
+  |                               |
+  |  200 OK                       |
+  |  Content-Type: application/json
+  |  {"pages": [...]}             |
+  | ←---------------------------- |
+```
+
+## HTTP methods
+
+The two methods you'll encounter most often:
+
+**GET** — retrieve data. Parameters go in the URL as query strings:
+```
+https://api.genderize.io?name=Anna
+
+https://www.google.com/search?q=Berlin
+```
+
+**POST** — send data to the server. Parameters go in the **request body** (usually JSON). Used when the query is complex or when the server is doing computation:
+```
+POST https://api.ted.europa.eu/v3/notices/search
+Body: {"query": "TD=7 AND buyer-country=DEU", "limit": 25}
+```
+
+## Status codes
+
+The three-digit code tells you immediately whether something worked:
+
+| Code | Meaning | What it might imply |
+|---|---|---|
+| `200` | OK | Everything worked! |
+| `400` | Bad Request | Your request is malformed |
+| `401` | Unauthorized | Maybe need an API key |
+| `403` | Forbidden | Access denied |
+| `404` | Not Found | Wrong URL? |
+| `429` | Too Many Requests | Slow down — you're being rate-limited |
+| `500` | Server Error | Problem on their end |
+
+## Headers
+
+Headers are key-value metadata attached to both requests and responses. Common ones you'll set or read:
+
+**Request headers** (you send):
+
+- `Accept: application/json` — tell the server you want JSON back
+- `Accept-Encoding: gzip, deflate` — tell the server which compression formats R can handle (important: omit `br`/brotli, which libcurl does not support by default)
+- `User-Agent` — identifies your client; good practice to set this
+- `Authorization: Bearer <token>` — for authenticated APIs
+
+**Response headers** (server sends back):
+
+- `Content-Type` — format of the response body
+- `X-Rate-Limit-Remaining` — how many requests you have left
+- `X-RateLimit-Reset` — when the limit resets
+
+## httr2 in practice
+
+`httr2` is the modern R package for HTTP. Its key design is a **pipeline**: build a request object, add modifiers, then perform it.
+
+```{r}
+#| label: httr2-intro
+library(httr2)
+
+# Build → modify → perform → extract
+resp <- request("https://api.genderize.io") |>  # base URL
+  req_url_query(name = "Anna") |>               # add ?name=Anna
+  req_headers(Accept = "application/json") |>   # set a header
+  req_timeout(10) |>                            # fail after 10s
+  req_perform()                                 # fire the request
+
+# Inspect the response
+resp_status(resp)       # 200
+resp_content_type(resp) # "application/json"
+resp_headers(resp)      # all response headers
+
+# Extract the body
+resp_body_string(resp)  # raw JSON string
+resp_body_json(resp)    # parsed into R list via jsonlite
+```
+
+### Key httr2 modifiers
+
+| Function | What it does |
+|---|---|
+| `req_url_query(key = val)` | Append `?key=val` to the URL |
+| `req_headers(Key = "val")` | Set request headers |
+| `req_body_json(list(...))` | Send a JSON body (POST) |
+| `req_auth_bearer_token(tok)` | Add `Authorization: Bearer` header |
+| `req_throttle(n / 60)` | Limit to n requests per minute |
+| `req_retry(max_tries = 3)` | Auto-retry on failure |
+| `req_timeout(seconds)` | Set a timeout |
+
+### Reading response headers
+
+```{r}
+#| label: read-headers
+# Single header
+resp |> resp_header("Content-Type")
+
+# All headers as a named list
+resp |> resp_headers()
+```
+
+::: {.callout-tip}
+## Where does the Network tab fit in?
+
+When you use your browser to interact with a website, every HTTP request your browser makes is visible in the **Network tab** of the developer tools. This means you can inspect the exact URL, method, headers, and body of any request — and then reproduce it in R. That is the entire basis of the undocumented API technique in Part 3.
+:::
+
+---
+
+# Part 2: API Refresher {#refresher}
+
+Before we go hunting for hidden APIs, let's make sure the basics are solid. An **API** (Application Programming Interface) is simply a structured way for two programs to talk to each other. On the web, that usually means: your code sends an HTTP request to a URL, and the server responds with data — nowadays almost always in **JSON** format.
+
+## JSON in R
+
+JSON is the lingua franca of web APIs. The standard R package for parsing it is **jsonlite**, which has been the community default for a decade. It's robust, well-maintained, and handles the tricky R-specific cases (data frames, NAs, nested lists) gracefully.
+
+```{r}
+#| eval: true
+
+library(jsonlite)
+
+# Parse a JSON string
+fromJSON('{"name": "Anna", "gender": "female", "probability": 0.97}')
+
+# Convert R objects to JSON
+toJSON(list(name = "Anna", country = "DE"), auto_unbox = TRUE)
+```
+
+## Example: the Genderize.io API
+
+[Genderize.io](https://genderize.io) predicts the likely gender of a name, along with a confidence score (`probability`) and the number of data points in its training database (`count`). It requires **no API key** for up to 100 names/day.
+
+It's also a useful object for thinking about **algorithmic fairness**: the model is trained heavily on Western names, so confidence is high for "James" or "Sophie" but degrades sharply for names from South Asia, East Africa, or East Asia.
+
+Before interacting with an API, it's worth checking out its documentation to understand the endpoints, parameters, and response structure. For Genderize.io, the docs are at [https://genderize.io/documentation](https://genderize.io/documentation).
+
+### Single name lookup
+
+```{r}
+library(httr2)
+library(jsonlite)
+
+resp <- request("https://api.genderize.io") |>
+  req_url_query(name = "Anna") |>
+  req_perform()
+
+resp |>
+  resp_body_string() |>
+  fromJSON()
+# $count    $name    $gender    $probability
+# 1673584   "Anna"   "female"   0.9          
+```
+
+### Checking your rate limit
+
+The API returns rate-limit information in the **response headers**. With 100 free requests/day, it's worth checking before running a big batch:
+
+```{r}
+# Inspect rate-limit headers from the last response
+list(
+  limit     = resp |> resp_header("X-Rate-Limit-Limit"),
+  remaining = resp |> resp_header("X-Rate-Limit-Remaining"),
+  reset_in  = resp |> resp_header("X-Rate-Limit-Reset") |> as.integer() |> (\(s) paste(s, "seconds"))()
+)
+```
+
+### Batch requests and a helper function
+
+The API accepts up to 10 names per request using repeated `name[]` parameters. Before writing our own wrapper, it's worth checking whether a dedicated R client already exists — packages like `genderizeR` were built exactly for this. However, `genderizeR` is no longer under active development and currently causes installation issues due to a corrupted dependency (`stringi`) on some systems. This is a good general lesson: **always look for existing wrappers and clients, but check when they were last updated and whether issues are being addressed before relying on them.**
+
+Here's a small wrapper built directly on `httr2` that handles batching and returns a tidy data frame:
+
+```{r}
+#| eval: true
+  
+genderize <- function(names) {
+  # Split into batches of 10 (API limit)
+  batches <- split(names, ceiling(seq_along(names) / 10))
+
+  map(batches, \(batch) {
+    resp <- request("https://api.genderize.io") |>
+      req_url_query(!!!setNames(as.list(batch), rep("name[]", length(batch)))) |>
+      req_throttle(10 / 60) |>   # stay well within limits
+      req_perform()
+
+    resp |>
+      resp_body_string() |>
+      fromJSON()
+  }) |>
+    list_rbind()
+}
+
+# Try it
+genderize(c("James", "Sophie", "Amara")) |>
+  select(name, gender, probability, count)
+```
+
+### Mini-audit: confidence by name origin
+
+Now use the helper to run a small fairness audit — does confidence vary systematically by where names come from?
+
+```{r}
+#| eval: true
+#| 
+names_df <- tibble(
+  name   = c("James", "Sophie", "Ingrid",   # W. European
+             "Amara", "Chioma", "Kwame",     # Sub-Saharan African
+             "Wei",   "Yuki",   "Ji-ho"),    # East Asian
+  region = c(rep("W. European", 3),
+             rep("Sub-Saharan African", 3),
+             rep("East Asian", 3))
+)
+
+results <- genderize(names_df$name) |>
+  select(name, gender, probability, count) |>
+  left_join(names_df, by = "name")
+
+ggplot(results, aes(x = reorder(name, probability), y = probability, fill = region)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Genderize.io: Prediction confidence by name origin",
+    x = NULL, y = "Probability", fill = "Region"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-tip}
+## Discussion
+
+- What do low `count` values tell you about the training data?
+- If a company uses genderize.io to personalise emails, what's the downstream effect of low-confidence predictions?
+- How would you design a more rigorous audit — what would your name sample look like, and what would you measure?
+:::
+
+---
+
+# Part 3: Undocumented APIs {#part3}
+
+> *"Most APIs are undocumented and hidden in plain sight."*  
+> — Leon Yin, [Inspect Element](https://inspectelement.org/apis.html)
+
+When you interact with a modern website — filtering search results, browsing an encyclopedia, or querying a government portal — your browser is quietly making structured data requests behind the scenes. These are **API calls**, and the data they return is often richer, cleaner, and more machine-readable than anything you could scrape from HTML.
+
+The trick is finding them.
+
+## What is an undocumented API?
+
+A documented API comes with a manual. The EU Open Data Portal, the U.S. Census Bureau, and the World Bank all publish official APIs with authentication keys, rate limits, and endpoint documentation.
+
+Undocumented APIs are the ones developers built for their own front-end — they power the search boxes, the dropdown filters, and the dynamic tables you see on websites. No one advertised them. But they're there, and they speak JSON.
+
+Some investigations are **only possible** once you find one of these hidden endpoints.
+
+---
+
+## Case study: Wikipedia search
+
+[Wikipedia](https://en.wikipedia.org) runs on **MediaWiki**, and behind its search box lies a clean, well-structured REST API. When you type into the Wikipedia search field and autocomplete suggestions appear, your browser is calling an internal endpoint — one that is not prominently advertised but is entirely open to use.
+
+This makes Wikipedia an ideal first target: the API is stable, requires no authentication, and returns well-structured JSON. The same technique you learn here applies directly to more complex targets — government databases, corporate transparency portals, parliamentary records.
+
+---
+
+## Tutorial: Finding and using undocumented APIs {#api-tutorial}
+
+We'll use Wikipedia's search as our target. The goal is to intercept the API call the website makes when you search, and reproduce it in R.
+
+### Step 1: Open the browser developer tools
+
+Navigate to [en.wikipedia.org](https://en.wikipedia.org/wiki/Main_Page) and open the developer tools:
+
+- **Mac**: `Cmd + Option + I`
+- **Windows/Linux**: `F12` or `Ctrl + Shift + I`
+
+Click the **Network** tab.
+
+### Step 2: Trigger a search request
+
+Click **Fetch/XHR** in the filter bar to show only API calls. Then type **"Hertie"** into the Wikipedia search box at the top of the page. New entries will appear in the Network panel as autocomplete results load.
+
+### Step 3: Find the data request
+
+Look for a request with a URL containing `/rest.php/v1/search/`. Click it and inspect:
+
+- **Headers tab** → method is `GET`, URL is `https://en.wikipedia.org/w/rest.php/v1/search/title?q=Hertie&limit=10`
+- **Response tab** → a JSON object with a `pages` array, each entry containing `id`, `title`, `description`, and `thumbnail`
+
+### Step 4: Copy as cURL and convert
+
+Right-click the request → **Copy** → **Copy as cURL**.
+
+Paste into [curlconverter.com](https://curlconverter.com/) and select **R**. You'll get something like this:
+
+```{r}
+#| label: curlconverter-raw
+# Raw output from curlconverter.com — this works, but contains a lot of noise
+library(httr2)
+
+wiki_out <-
+  request("https://en.wikipedia.org/w/rest.php/v1/search/title") |>
+  req_url_query(
+    q     = "Hertie",
+    limit = "10"
+  ) |>
+  req_headers(
+    `User-Agent`      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
+    Accept            = "application/json",
+    `Accept-Language` = "en-US,en;q=0.9",
+    `Accept-Encoding` = "gzip, deflate",   # ← remove br/zstd: libcurl can't decode them
+    Referer           = "https://en.wikipedia.org/wiki/Main_Page",
+    `Sec-GPC`         = "1",
+    Connection        = "keep-alive",
+    # Cookie          = "..."  ← remove: cookies are session-specific and unnecessary
+    `Sec-Fetch-Dest`  = "empty",
+    `Sec-Fetch-Mode`  = "cors",
+    `Sec-Fetch-Site`  = "same-origin",
+    DNT               = "1"
+  ) |>
+  req_perform()
+```
+
+::: {.callout-tip}
+## Cleaning up curlconverter output
+
+curlconverter faithfully copies **everything** your browser sent — including session cookies, brotli encoding flags, and browser fingerprinting headers. Most of these are unnecessary for the API call to work. Two things always need cleaning:
+
+1. **Remove or replace the Cookie header** — it is session-specific and will expire. Most public APIs don't need it.
+2. **Change `Accept-Encoding` to `"gzip, deflate"`** — browsers advertise brotli (`br`) by default, but R's libcurl cannot decode it and will throw an error.
+
+Everything else (Sec-Fetch-*, DNT, Priority) is browser metadata that servers typically ignore. You can remove it to keep your code clean.
+:::
+
+### Step 5: A minimal working request
+
+Once you know what the API needs, strip it down. For Wikipedia's search endpoint, all that's required is the query and a sensible `User-Agent` (Wikipedia's API policy asks that you identify your client):
+
+```{r}
+#| label: minimal-request
+#| eval: true
+library(httr2)
+library(tidyverse)
+
+wiki_out <-
+  request("https://en.wikipedia.org/w/rest.php/v1/search/title") |>
+  req_url_query(q = "Hertie", limit = 10) |>
+  req_headers(
+    `User-Agent`      = "DataJournalismCourse/1.0 (hertie-school.org)",
+    Accept            = "application/json",
+    `Accept-Encoding` = "gzip, deflate"
+  ) |>
+  req_perform()
+
+resp_status(wiki_out)  # 200 = success
+```
+
+### Step 6: Parse the response
+
+```{r}
+#| label: parse-wiki
+#| eval: true
+
+# Option A: manual with jsonlite — gives full control
+wiki_out |>
+  resp_body_string() |>
+  jsonlite::fromJSON()
+
+# Option B: simplifyVector = TRUE — auto-converts to data frame
+wiki_df <-
+  wiki_out |>
+  resp_body_json(simplifyVector = TRUE) |>
+  pluck("pages")
+
+wiki_df
+```
+
+`simplifyVector = TRUE` passes a flag to jsonlite that collapses lists of uniform objects directly into a data frame — no manual mapping needed. The `thumbnail` column comes out as a nested data frame; flatten it with `unnest_wider()`:
+
+```{r}
+#| label: flatten-wiki
+#| eval: true
+wiki_df |>
+  unnest_wider(thumbnail, names_sep = "_") |>
+  select(id, title, description, thumbnail_url, thumbnail_width, thumbnail_height)
+```
+
+### Step 7: Explore the API further
+
+The endpoint we found is just one of several. Wikipedia's REST API also offers:
+
+```{r}
+#| label: wiki-explore
+
+# Full-text search (searches article bodies, not just titles)
+request("https://en.wikipedia.org/w/rest.php/v1/search/page") |>
+  req_url_query(q = "Hertie School", limit = 5) |>
+  req_headers(`User-Agent` = "DataJournalismCourse/1.0",
+              `Accept-Encoding` = "gzip, deflate") |>
+  req_perform() |>
+  resp_body_json(simplifyVector = TRUE) |>
+  pluck("pages") |>
+  select(title, description, excerpt)
+```
+
+The `excerpt` field returns a snippet of article text with the search term highlighted — useful for quickly assessing relevance.
+
+```{r}
+#| label: wiki-paginate
+
+# Paginate: use the `offset` parameter to retrieve the next page of results
+page2 <-
+  request("https://en.wikipedia.org/w/rest.php/v1/search/page") |>
+  req_url_query(q = "Hertie School", limit = 5, offset = 5) |>
+  req_headers(`User-Agent` = "DataJournalismCourse/1.0",
+              `Accept-Encoding` = "gzip, deflate") |>
+  req_perform() |>
+  resp_body_json(simplifyVector = TRUE) |>
+  pluck("pages")
+```
+
+::: {.callout-caution}
+## Responsible use
+
+- Wikipedia's API is free and open, but the [Wikimedia API etiquette](https://www.mediawiki.org/wiki/API:Etiquette) asks that you identify your client in the `User-Agent` header and keep requests reasonable.
+- Use `req_throttle()` if you're making many calls in a loop.
+- Cache results locally — don't re-fetch data you already have.
+:::
+
+### ✋ Your turn
+
+1. Go to [tiktok.com](https://www.tiktok.com/), open the Network tab (filter by **Fetch/XHR**), and type a search query into the search box. Look for requests that return JSON containing search suggestions or results.
+2. Copy one of those requests as cURL, convert it at curlconverter.com, clean up the headers (remove cookies, fix Accept-Encoding), and execute in R.
+3. Parse the response. What does the data structure look like — are you seeing autocomplete suggestions, full results, or something else?
+4. Try modifying the query parameter to a different search term. Does the same endpoint still work, or do you need to adjust other parameters?
+5. Write a short paragraph: what story could you tell by systematically collecting TikTok search suggestions for a set of politically or socially relevant queries?
+
+---
+
+# Part 4: Browser Automation {#part4}
+
+> *"Browser automation is a fundamental web scraping technique for building your own dataset. It is essential for investigating personalization, working with rendered elements, and waiting for scripts and code to execute on a web page."*  
+> — Piotr Sapiezynski & Leon Yin, [Inspect Element](https://inspectelement.org/browser_automation.html)
+
+Some websites do not have a convenient hidden API. The content is rendered by JavaScript after the page loads, injected into the DOM by a front-end framework — React, Vue, Angular — that `rvest` and `read_html()` will never see.
+
+For these sites, you need **browser automation**: R controlling an actual Chrome browser, clicking buttons and waiting for content to appear, exactly as a human would.
+
+## When do you need browser automation?
+
+Prefer the undocumented API approach (Part 3) whenever possible — it is faster, lighter, and more reliable. Use browser automation when:
+
+1. **The content is rendered dynamically** and does not appear in `view-source:`.
+2. **You need to simulate interaction** — logging in, clicking a "load more" button, filling a form, or accepting a cookie banner.
+3. **The site detects and blocks simple HTTP requests** but allows real browsers.
+
+## Case study: YouTube search result audits
+
+YouTube is built almost entirely in React — virtually nothing you care about appears in the raw HTML source. Every video title, channel name, view count, and thumbnail URL is injected into the DOM by JavaScript after the page loads. This makes `rvest` alone useless; browser automation is the only practical approach. YouTube does offer an official [Data API](https://paulcbauer.github.io/apis_for_social_scientists_a_review/youtube-api.html), but it returns aggregated metadata rather than the ranked search results and recommendation sequences that matter for algorithmic audits — making browser automation the necessary choice for this kind of research.
+
+Researchers studying algorithmic amplification have used browser automation to systematically collect YouTube search results for sets of politically or scientifically contested queries — comparing what the platform surfaces for terms like "vaccine safety", "climate change", or "migration" across different languages and regions. The resulting datasets have been used to audit compliance with the EU's Digital Services Act (DSA), which requires platforms to assess and mitigate risks of "systemic" content recommendation.
+
+Mozilla Foundation's [YouTube Regrets](https://www.mozillafoundation.org/en/youtube/findings/) project and AlgorithmWatch's [Automating Society](https://algorithmwatch.org/en/automating-society/) reports are prominent examples of this research genre. Both rely on automated browsers to collect the evidence that underpins their policy recommendations.
+
+---
+
+
+## Tutorial: Browser automation with `selenider` {#automation-tutorial}
+
+[`selenider`](https://ashbythorpe.github.io/selenider/) is a modern R package that wraps Chrome via ChromeDriver. It has a clean, pipe-friendly API and excellent error messages — much easier to use than `RSelenium`.
+
+::: {.callout-note}
+## What is ChromeDriver?
+
+**ChromeDriver** is a small server that acts as a bridge between your R code and a real Chrome browser. When `selenider` opens a browser window, it is actually sending commands to ChromeDriver, which translates them into Chrome's internal automation protocol (the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)). ChromeDriver must match the version of Chrome installed on your machine — `selenider::install_selenider()` handles this automatically by downloading the correct driver via the `wdman` package.
+:::
+
+### Step 1: Start a browser session
+
+```{r}
+#| label: selenider-setup
+library(tidyverse)
+library(rvest)
+library(selenider)
+
+# Open a Chrome window (set headless = FALSE to watch it work)
+session <- selenider_session(
+  "chromote",
+  options = chromote_options(headless = FALSE, width = 1280, height = 900)
+)
+```
+
+### Step 2: Navigate to YouTube and search
+
+Try fetching a YouTube search page the ordinary way first, so you can see why browser automation is necessary:
+
+```{r}
+#| label: why-not-rvest
+
+library(rvest)
+
+# This returns almost no useful content — just a shell of HTML
+# with no video titles or metadata
+page <- read_html("https://www.youtube.com/results?search_query=climate+change")
+page |> html_elements("h3") |> html_text()
+# → character(0)   ← nothing there
+```
+
+Now with browser automation:
+
+```{r}
+#| label: navigate
+
+query <- "climate change"
+
+open_url(
+  paste0("https://www.youtube.com/results?search_query=",
+         URLencode(query, reserved = TRUE))
+)
+
+# Give the page time to load and the cookie popup to appear
+Sys.sleep(3)
+
+# Handle the cookie consent popup — click "Reject all" if it appears
+reject_btn <- s('#content > div.body.style-scope.ytd-consent-bump-v2-lightbox > div.eom-buttons.style-scope.ytd-consent-bump-v2-lightbox > div:nth-child(1) > ytd-button-renderer:nth-child(1) > yt-button-shape > button > yt-touch-feedback-shape > div.yt-spec-touch-feedback-shape__fill')
+if (is_present(reject_btn)) {
+  elem_click(reject_btn)
+  Sys.sleep(2)  # wait for popup to close and page to settle
+}
+
+Sys.sleep(2)
+```
+
+### Step 3: Find elements on the rendered page
+
+Use the **Inspector** tab (right-click on a video title → Inspect) to identify CSS selectors. YouTube's selectors are stable because they use custom HTML elements (`ytd-*`) rather than generic class names.
+
+```{r}
+#| label: find-elements
+
+# Each search result is wrapped in a ytd-video-renderer element
+result_cards <- ss("ytd-video-renderer")  # ss() = find ALL matching elements
+length(result_cards)  # how many results loaded?
+```
+
+::: {.callout-tip}
+## Reading the page source after JavaScript runs
+
+After navigation and any interaction, extract the *rendered* HTML source and hand it to `rvest`:
+
+```r
+html <- read_html(get_page_source(session))
+```
+
+This captures what is actually displayed in the browser — not the empty shell that `read_html(url)` would return directly.
+:::
+
+### Step 4: Extract data from rendered HTML
+
+```{r}
+#| label: extract-html
+
+html <- get_page_source()  # already returns an xml_document; no read_html() needed
+
+# Video titles and URLs
+titles <- html |>
+  html_elements("ytd-video-renderer #video-title") |>
+  html_text(trim = TRUE)
+
+urls <- html |>
+  html_elements("ytd-video-renderer #video-title") |>
+  html_attr("href") |>
+  (\(x) paste0("https://www.youtube.com", x))()
+
+# The channel name node contains two yt-formatted-string elements (visible + screen-reader copy).
+# We take every second element starting from the first to get one name per video.
+channels_raw <- html |>
+  html_elements("ytd-video-renderer ytd-channel-name yt-formatted-string") |>
+  html_text(trim = TRUE)
+channels <- channels_raw[seq(1, length(channels_raw), by = 2)]
+
+# View counts and upload dates appear together in the metadata line
+metadata <- html |>
+  html_elements("ytd-video-renderer #metadata-line span") |>
+  html_text(trim = TRUE)
+
+# Metadata comes in pairs: (view count, upload date) per video
+view_counts  <- metadata[seq(1, length(metadata), by = 2)]
+upload_dates <- metadata[seq(2, length(metadata), by = 2)]
+
+results <- tibble(
+  title       = titles,
+  channel     = channels,
+  views       = view_counts,
+  uploaded    = upload_dates,
+  url         = urls
+)
+
+results
+```
+
+### Step 5: Collect results at scale with scrolling
+
+YouTube's search page uses **infinite scroll**: only ~20 results are rendered initially, and more are injected into the DOM as you scroll down. The function below automates this — it navigates to a query, handles the cookie popup, scrolls `n_scrolls` times (each scroll triggers a new batch of ~20 results), then extracts all visible results from the fully rendered page. Running the same function on multiple queries lets you compare what YouTube surfaces for different search terms — the basis of an algorithmic audit.
+
+```{r}
+#| label: scroll-and-compare
+
+collect_search_results <- function(query, n_scrolls = 3) {
+  open_url(
+    paste0("https://www.youtube.com/results?search_query=",
+           URLencode(query, reserved = TRUE))
+  )
+  Sys.sleep(3)
+
+  # Dismiss cookie popup if present
+  reject_btn <- s('#content > div.body.style-scope.ytd-consent-bump-v2-lightbox > div.eom-buttons.style-scope.ytd-consent-bump-v2-lightbox > div:nth-child(1) > ytd-button-renderer:nth-child(1) > yt-button-shape > button > yt-touch-feedback-shape > div.yt-spec-touch-feedback-shape__fill')
+  if (is_present(reject_btn)) {
+    elem_click(reject_btn)
+    Sys.sleep(2)
+  }
+
+  # Scroll to the last visible result card to trigger lazy-loading of the next batch.
+  # YouTube's infinite scroll fires when the last card enters the viewport,
+  # so scrolling to it is more reliable than a raw JS window.scrollBy().
+  for (i in seq_len(n_scrolls)) {
+    cards <- ss("ytd-video-renderer")
+    elem_scroll_to(cards[[length(cards)]])
+    Sys.sleep(2)  # wait for new cards to render before scrolling again
+  }
+
+  html <- get_page_source()
+
+  titles   <- html |> html_elements("ytd-video-renderer #video-title") |> html_text(trim = TRUE)
+  channels_raw <- html |> html_elements("ytd-video-renderer ytd-channel-name yt-formatted-string") |> html_text(trim = TRUE)
+  channels <- channels_raw[seq(1, length(channels_raw), by = 2)]
+  metadata <- html |> html_elements("ytd-video-renderer #metadata-line span") |> html_text(trim = TRUE)
+
+  tibble(
+    query   = query,
+    rank    = seq_along(titles),
+    title   = titles,
+    channel = channels,
+    views   = metadata[seq(1, length(metadata), by = 2)],
+    url     = html |>
+                html_elements("ytd-video-renderer #video-title") |>
+                html_attr("href") |>
+                (\(x) paste0("https://www.youtube.com", x))()
+  )
+}
+
+# Compare two related queries — what does YouTube surface differently?
+queries <- c("Klimawandel", "climate change")
+
+all_results <- map_dfr(queries, \(q) {
+  message("Searching: ", q)
+  Sys.sleep(1)
+  collect_search_results(q, n_scrolls = 3)
+})
+
+# Which channels appear for both queries vs. only one?
+all_results |>
+  count(query, channel, sort = TRUE) |>
+  pivot_wider(names_from = query, values_from = n, values_fill = 0)
+```
+
+### Step 6: Close the session
+
+```{r}
+#| label: close
+close_session(session)
+```
+
+---
+
+## Comparing approaches: API vs. browser automation
+
+| | Undocumented API | Browser Automation |
+|---|---|---|
+| **Speed** | Fast (milliseconds per request) | Slow (seconds per page) |
+| **Reliability** | High (structured data) | Medium (DOM can change) |
+| **Setup effort** | Low–Medium | Medium |
+| **Works on dynamic sites** | Sometimes | Always |
+| **Detectable?** | Harder to detect | Easier to detect |
+| **Best for** | Search results, large datasets | Forms, login-gated, dynamic pages |
+
+**Rule of thumb**: Always look for an API first. Only use browser automation when you have to.
+
+---
+
+## ✋ Your turn
+
+**Option A — YouTube search audit (recommended):**  
+Choose a policy topic you care about — migration, nuclear energy, vaccine hesitancy, a recent national election. Pick 2–3 search queries for the same topic (e.g., the same term in English, German, and French). Use the `collect_search_results()` function to gather the top \~40 results for each query. Which channels appear consistently across languages? Are the same videos surfaced? Write 2–3 sentences describing what this might reveal about YouTube's recommendation logic.
+
+**Option B — German Federal Gazette (Bundesanzeiger):**  
+[bundesanzeiger.de](https://www.bundesanzeiger.de) publishes mandatory corporate filings through a JavaScript-rendered interface. Use `selenider` to fill the search form, wait for results to appear, and collect company names, filing types, and publication dates. (Note: the site uses a CAPTCHA on some search paths — try company name search first.)
+
+For either option:
+1. Open the Network tab first and check whether a hidden API exists — it is always faster to use an API if one is available.
+2. Save your results to a CSV.
+3. Write 2–3 sentences on what story you could tell with this data.
+
+---
+
+# Putting it together: a mini-investigation
+
+Here is a realistic workflow that combines both techniques: use the Wikipedia REST API to collect a set of articles programmatically, then use browser automation to extract the full rendered content from their detail pages — which includes infobox data and section structure that the search API doesn't return.
+
+::: {.callout-note}
+## Browser automation here is illustrative only
+
+Wikipedia article pages are **static HTML** — they do not require JavaScript to render their content. Using browser automation to retrieve them is therefore unnecessary overhead. In a real project you would download each page directly with `httr2` and parse it with `rvest::read_html()`, iterating over URLs in a loop or with `purrr::map()`. See the [session on scraping multiple pages](https://raw.githack.com/intro-to-data-science-25/labs/main/session-05-web-scraping/5-web-scraping.html) from the IDS lab materials for a clean template. Browser automation is retained here solely to show how the two techniques can be combined in a single workflow.
+:::
+
+```{r}
+#| label: mini-investigation
+
+library(httr2)
+library(selenider)
+library(rvest)
+library(tidyverse)
+
+# Step 1: Use the Wikipedia search API to find articles about
+# public policy schools in Europe
+search_results <-
+  request("https://en.wikipedia.org/w/rest.php/v1/search/page") |>
+  req_url_query(q = "public policy school Europe", limit = 20) |>
+  req_headers(`User-Agent`      = "DataJournalismCourse/1.0",
+              `Accept-Encoding` = "gzip, deflate") |>
+  req_perform() |>
+  resp_body_json(simplifyVector = TRUE) |>
+  pluck("pages") |>
+  select(key, title, description, excerpt)
+
+# Step 2: For the top results, use browser automation to retrieve
+# full infobox data from each article page.
+
+session <- selenider_session("chromote", options = chromote_options(headless = TRUE, width = 1280, height = 900))
+
+get_infobox <- function(article_key) {
+  open_url(paste0("https://en.wikipedia.org/wiki/", article_key))
+  Sys.sleep(2)
+
+  html <- get_page_source()
+
+  # Extract infobox rows: label → value pairs
+  labels <- html |>
+    html_elements(".infobox th") |>
+    html_text(trim = TRUE)
+
+  values <- html |>
+    html_elements(".infobox td") |>
+    html_text(trim = TRUE)
+
+  if (length(labels) == 0) return(NULL)
+
+  tibble(
+    article = article_key,
+    label   = labels[seq_len(min(length(labels), length(values)))],
+    value   = values[seq_len(min(length(labels), length(values)))]
+  )
+}
+
+# Collect infoboxes for the top 10 results
+infoboxes <- map(
+  head(search_results$key, 10),
+  \(key) {
+    message("Fetching: ", key)
+    Sys.sleep(1)
+    get_infobox(key)
+  }
+) |>
+  compact() |>
+  list_rbind()
+
+close_session(session)
+
+# Step 3: Analyse — what do the infoboxes tell us?
+# E.g. which institutions list an endowment? What are their founding years?
+infoboxes |>
+  filter(str_detect(label, regex("established|founded|endow", ignore_case = TRUE))) |>
+  pivot_wider(names_from = label, values_from = value) |>
+  print(n = 20)
+```
+
+---
+
+# Resources
+
+- Leon Yin, *Inspect Element* — [inspectelement.org](https://inspectelement.org)  
+  The best practical guide to this workflow, in Python. The undocumented API section in this tutorial is mainly inspired by this guide.
+
+- `httr2` documentation — [httr2.r-lib.org](https://httr2.r-lib.org/)  
+  The modern R HTTP client. Read especially the articles on [requests](https://httr2.r-lib.org/articles/httr2.html) and [error handling](https://httr2.r-lib.org/reference/req_retry.html).
+
+- `selenider` documentation — [ashbythorpe.github.io/selenider](https://ashbythorpe.github.io/selenider/)  
+  R browser automation with a clean tidyverse-style API.
+
+- [curlconverter.com](https://curlconverter.com/) — converts cURL commands to R (`httr2`), Python, and many other languages.
+
+- The Markup, *[How we investigated Google](https://themarkup.org/google-the-giant/2020/07/28/how-we-analyzed-google-search-results-web-assay-parsing-tool)* — a detailed methodology on using browser automation in a real investigation.
+
+---
+
+::: {.callout-note collapse="true"}
+## Session info
+
+```{r}
+#| eval: true
+sessionInfo()
+```
+:::
