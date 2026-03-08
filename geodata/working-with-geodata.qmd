@@ -1,0 +1,892 @@
+---
+title: "Working with Geodata in R"
+subtitle: "E1493 - Data Journalism"
+author: "Simon Munzert"
+institution: "Hertie School"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: false
+    theme: cosmo
+    code-fold: false
+    code-tools: true
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    highlight-style: github
+    embed-resources: true
+    link-external-newwindow: true
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| eval: true
+#| include: false
+#| label: load-packages
+
+pkgs <- c("tidyverse", "sf", "terra", "rnaturalearth",
+          "rnaturalearthdata", "nominatimlite", "tidygeocoder")
+lapply(pkgs, library, character.only = TRUE)
+```
+
+::: {.callout-note}
+## Before you start
+
+Install the packages used in this workshop:
+
+```r
+install.packages(c(
+  "tidyverse", "sf", "terra", "stars",
+  "rnaturalearth", "rnaturalearthdata", "rnaturalearthhires",
+  "nominatimlite", "tidygeocoder", "osmdata"
+))
+```
+
+This script accompanies the **Session 6 slides** on Mapping and Geodata. It's designed as a hands-on complement — the slides cover concepts like spatial data types, projections, and distance; this script lets you work with real spatial data in R. We use the **German breweries** dataset throughout as a running example.
+
+The script builds on concepts from Pebesma & Bivand (2023), [*Spatial Data Science: With Applications in R*](https://r-spatial.org/book/), freely available online. If you want to go deeper, that book is the definitive reference for `sf` and `stars`.
+:::
+
+---
+
+# Part 1: Importing Spatial Data {#importing}
+
+The two main types of spatial data — **vector** (points, lines, polygons) and **raster** (gridded pixels) — each have their own packages and workflows in R. The `sf` package handles vector data; `terra` (and `stars`) handle raster data. Both integrate with the tidyverse.
+
+
+## Vector data with `sf`
+
+The workhorse function is `st_read()`, which can read shapefiles, GeoJSON, GeoPackage, KML, and dozens of other formats via GDAL. Let's start by loading a polygon map of Germany from the `rnaturalearth` package:
+
+```{r}
+#| eval: true
+#| label: import-germany
+
+library(sf)
+library(rnaturalearth)
+
+# Country boundary as an sf object
+germany <- ne_countries(
+  scale = "medium",
+  country = "Germany",
+  returnclass = "sf"
+)
+
+# What does an sf object look like?
+class(germany)
+glimpse(germany)
+```
+
+An `sf` object is just a data frame with a special `geometry` column. This means all your familiar `dplyr` verbs work on it — `filter()`, `mutate()`, `select()`, `left_join()`, you name it. The geometry just comes along for the ride.
+
+```{r}
+#| eval: true
+#| label: sf-structure
+
+# The geometry column
+st_geometry(germany)
+
+# CRS (coordinate reference system)
+st_crs(germany)
+```
+
+The CRS tells you how coordinates map onto the Earth's surface. Here we have WGS 84 (EPSG:4326) — the standard longitude/latitude system used by GPS.
+
+
+## Reading files from disk
+
+In real projects, you'll often read shapefiles or GeoJSON files. The syntax is the same regardless of format — `st_read()` detects the driver automatically:
+
+```{r}
+#| label: read-shapefile
+
+# Reading a shapefile (hypothetical example)
+# districts <- st_read("data/german_districts.shp")
+
+# Reading GeoJSON
+# districts <- st_read("data/german_districts.geojson")
+
+# Reading GeoPackage (modern, recommended format)
+# districts <- st_read("data/german_districts.gpkg")
+```
+
+::: {.callout-tip}
+## Shapefile vs. GeoPackage
+
+Shapefiles are the legacy standard — they consist of 4-6 files (`.shp`, `.dbf`, `.shx`, `.prj`, ...) that must travel together. GeoPackage (`.gpkg`) is the modern replacement: a single file, no column name truncation, no file size limits. Use GeoPackage when you can.
+:::
+
+
+## Getting German state boundaries
+
+For our brewery analysis, we'll need state-level polygons. Let's get them:
+
+```{r}
+#| eval: true
+#| label: german-states
+
+# German federal states (Bundesländer)
+germany_states <- ne_states(country = "Germany", returnclass = "sf")
+
+ggplot(germany_states) +
+  geom_sf(fill = "gray95", color = "gray40") +
+  theme_minimal(base_size = 14) +
+  labs(title = "German federal states (Bundesländer)")
+```
+
+::: {.callout-note}
+## Where to find spatial data
+
+Good sources for administrative boundaries and other geodata include:
+
+- [Natural Earth](https://www.naturalearthdata.com/) — global boundaries at multiple scales (via `rnaturalearth`)
+- [GADM](https://gadm.org/) — detailed subnational boundaries
+- [Geoportal.de](https://www.geoportal.de/) — official German geodata
+- [OpenStreetMap](https://www.openstreetmap.org/) — crowd-sourced, very detailed (via `osmdata`)
+- [Eurostat GISCO](https://ec.europa.eu/eurostat/web/gisco) — European administrative boundaries
+:::
+
+
+## Raster data with `terra`
+
+Raster data represents continuous surfaces — elevation, temperature, satellite imagery — as regular grids of pixels. The `terra` package (successor to `raster`) is the standard tool:
+
+```{r}
+#| eval: true
+#| label: raster-intro
+
+library(terra)
+
+# Create a simple example raster covering Germany
+# (In practice, you'd read a real file with rast())
+r <- rast(
+  xmin = 5.5, xmax = 15.5,
+  ymin = 47, ymax = 55.5,
+  resolution = 0.1,
+  crs = "EPSG:4326"
+)
+
+# Fill with random "elevation" values for demonstration
+values(r) <- runif(ncell(r), min = 0, max = 2000)
+r
+```
+
+```{r}
+#| eval: true
+#| label: raster-plot
+
+# Quick plot
+plot(r, main = "Simulated raster over Germany")
+```
+
+In real projects, you'd read raster files like GeoTIFF or NetCDF:
+
+```{r}
+#| label: raster-read
+
+# Reading real raster data
+# elevation <- rast("data/germany_dem.tif")
+# temperature <- rast("data/temperature_2024.nc")
+```
+
+::: {.callout-tip}
+## `terra` vs. `stars`
+
+Both packages handle raster data. `terra` is faster and more memory-efficient for classic raster operations. `stars` integrates better with `sf` and handles data cubes (e.g., space × time). For most data journalism work, `terra` is the pragmatic choice.
+:::
+
+---
+
+# Part 2: Projections {#projections}
+
+A coordinate reference system (CRS) defines how coordinates map onto the Earth. Getting this right matters — wrong projections lead to distorted maps and incorrect distance/area calculations.
+
+
+## The key distinction: geographic vs. projected
+
+**Geographic CRS** (e.g., WGS 84 / EPSG:4326): Coordinates are in degrees of longitude and latitude on an ellipsoidal model of the Earth. This is what GPS uses.
+
+**Projected CRS** (e.g., UTM Zone 32N / EPSG:32632): Coordinates are in meters (or feet) on a flat 2D plane. Every projection introduces some distortion — the question is which property you want to preserve: area, shape, distance, or direction.
+
+
+## Checking and setting CRS
+
+```{r}
+#| eval: true
+#| label: check-crs
+
+# Check the CRS of our Germany polygon
+st_crs(germany)
+
+# The EPSG code is the shorthand
+st_crs(germany)$epsg
+```
+
+
+## Reprojecting data
+
+Use `st_transform()` to reproject vector data. For Germany, a good projected CRS is **ETRS89 / UTM Zone 32N** (EPSG:25832) — this is the official German reference system:
+
+```{r}
+#| eval: true
+#| label: reproject
+
+# Reproject to ETRS89 / UTM zone 32N
+germany_proj <- st_transform(germany, crs = 25832)
+
+# Now coordinates are in meters, not degrees
+st_bbox(germany)       # in degrees
+st_bbox(germany_proj)  # in meters
+```
+
+```{r}
+#| eval: true
+#| label: projection-comparison
+#| fig-height: 4
+
+# Visual comparison
+p1 <- ggplot(germany) +
+  geom_sf(fill = "gray90") +
+  labs(title = "WGS 84 (geographic)") +
+  theme_minimal()
+
+p2 <- ggplot(germany_proj) +
+  geom_sf(fill = "gray90") +
+  labs(title = "ETRS89 / UTM 32N (projected)") +
+  theme_minimal()
+
+library(patchwork)
+p1 + p2
+```
+
+The visual difference for Germany is subtle, but the implications for calculations are real: area and distance computations on projected data use planar geometry (fast, exact), while geographic coordinates require spherical/ellipsoidal calculations.
+
+
+## When does the projection matter?
+
+For **display** (making maps), the projection choice is mostly aesthetic. For **analysis** (calculating distances, areas, buffers), it's critical. A common workflow:
+
+1. Store and exchange data in WGS 84 (EPSG:4326) — the universal standard.
+2. Reproject to an appropriate local CRS before doing any spatial calculations.
+3. Reproject back to WGS 84 for web mapping or data exchange if needed.
+
+```{r}
+#| eval: true
+#| label: area-comparison
+
+# Area of Germany in different CRS
+st_area(germany) |> units::set_units("km^2")        # spherical calculation
+st_area(germany_proj) |> units::set_units("km^2")    # planar calculation
+```
+
+::: {.callout-important}
+## A common trap
+
+If you compute distances or areas on unprojected (lon/lat) data, `sf` will use spherical geometry by default (via the `s2` library), which is correct but slower. If you accidentally treat lon/lat as planar coordinates (e.g., by disabling `s2`), you'll get wrong results — especially at higher latitudes where one degree of longitude is much less than 111 km.
+:::
+
+---
+
+# Part 3: Transformations and Spatial Overlay {#transformations}
+
+Spatial transformations let you combine datasets: which breweries are in Bavaria? How many points fall within each state? What's the nearest city to each brewery? This is where spatial data becomes powerful for journalism.
+
+
+## Loading our brewery data
+
+Let's load the geocoded brewery coordinates from the scraping exercise:
+
+```{r}
+#| eval: true
+#| label: load-breweries
+
+# Load the pre-geocoded brewery data
+load("coords_breweries.RData")
+head(coords_df)
+
+# Clean: filter to plausible German coordinates
+breweries <- coords_df |>
+  filter(
+    !is.na(lon), !is.na(lat),
+    lon >= 5.5, lon <= 15.5,
+    lat >= 47, lat <= 55.5
+  )
+
+nrow(breweries)
+```
+
+
+## Converting a data frame to an `sf` object
+
+The brewery data is just a regular data frame with lon/lat columns. To make it spatial, we use `st_as_sf()`:
+
+```{r}
+#| eval: true
+#| label: breweries-sf
+
+breweries_sf <- st_as_sf(
+  breweries,
+  coords = c("lon", "lat"),
+  crs = 4326  # WGS 84
+)
+
+# It's now a spatial object
+class(breweries_sf)
+head(breweries_sf)
+```
+
+```{r}
+#| eval: true
+#| label: breweries-quick-map
+
+# Quick check: plot breweries on top of Germany
+ggplot() +
+  geom_sf(data = germany, fill = "gray95") +
+  geom_sf(data = breweries_sf, color = "red", size = 0.4, alpha = 0.5) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Breweries in Germany")
+```
+
+
+## Spatial join: which state is each brewery in?
+
+The classic overlay operation: assign each point to the polygon it falls within. This is `st_join()` — the spatial equivalent of `left_join()`:
+
+```{r}
+#| eval: true
+#| label: spatial-join
+
+# Join breweries to states: each brewery gets the attributes of the state it's in
+breweries_with_state <- st_join(breweries_sf, germany_states["name"])
+
+head(breweries_with_state)
+```
+
+```{r}
+#| eval: true
+#| label: breweries-per-state
+
+# Count breweries per state
+breweries_per_state <- breweries_with_state |>
+  st_drop_geometry() |>
+  count(name, sort = TRUE) |>
+  rename(state = name, n_breweries = n)
+
+breweries_per_state
+```
+
+No surprise: Bavaria dominates. Let's put this on a map.
+
+```{r}
+#| eval: true
+#| label: choropleth-breweries
+#| fig-height: 6
+
+# Merge counts back to the state polygons
+states_with_breweries <- germany_states |>
+  left_join(breweries_per_state, by = c("name" = "state"))
+
+ggplot(states_with_breweries) +
+  geom_sf(aes(fill = n_breweries), color = "white") +
+  scale_fill_viridis_c(
+    option = "inferno",
+    direction = -1,
+    na.value = "gray90",
+    name = "Breweries"
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Number of breweries by German state",
+    caption = "Source: biermap24.de"
+  )
+```
+
+
+## Buffering, intersection, and other geometric operations
+
+`sf` provides a full set of geometric operations. Here are some commonly useful ones:
+
+```{r}
+#| eval: true
+#| label: geometric-ops
+
+# Reproject for metric operations
+breweries_proj <- st_transform(breweries_sf, 25832)
+germany_states_proj <- st_transform(germany_states, 25832)
+
+# Buffer: 50 km circle around Berlin
+berlin_point <- st_sfc(st_point(c(13.405, 52.52)), crs = 4326) |>
+  st_transform(25832)
+berlin_buffer <- st_buffer(berlin_point, dist = 50000)  # 50 km in meters
+
+# Which breweries fall within 50 km of Berlin?
+breweries_near_berlin <- st_intersection(breweries_proj, berlin_buffer)
+cat("Breweries within 50 km of Berlin:", nrow(breweries_near_berlin), "\n")
+```
+
+```{r}
+#| eval: true
+#| label: buffer-map
+
+# Visualize the buffer
+ggplot() +
+  geom_sf(data = germany_states_proj, fill = "gray95", color = "gray60") +
+  geom_sf(data = berlin_buffer, fill = "steelblue", alpha = 0.2, color = "steelblue") +
+  geom_sf(data = breweries_proj, color = "red", size = 0.3, alpha = 0.3) +
+  geom_sf(data = breweries_near_berlin, color = "darkred", size = 1.5) +
+  coord_sf(
+    xlim = st_bbox(berlin_buffer)[c(1, 3)] + c(-100000, 100000),
+    ylim = st_bbox(berlin_buffer)[c(2, 4)] + c(-100000, 100000)
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Breweries within 50 km of Berlin",
+    subtitle = "Blue circle = 50 km buffer around city center"
+  )
+```
+
+
+## Key transformation functions at a glance
+
+Here are the `sf` functions you'll use most often for spatial analysis:
+
+```{r}
+#| eval: false
+#| label: transformation-cheatsheet
+
+# Predicates (return TRUE/FALSE or index lists)
+st_intersects(x, y)     # do geometries intersect?
+st_within(x, y)         # is x fully within y?
+st_contains(x, y)       # does x fully contain y?
+st_is_within_distance(x, y, dist)  # within distance threshold?
+
+# Operations (return new geometries)
+st_intersection(x, y)   # clip x to y (overlay)
+st_difference(x, y)     # x minus y
+st_union(x)             # merge all geometries into one
+st_buffer(x, dist)      # expand/contract by distance
+st_centroid(x)          # center point of polygons
+
+# Measurements
+st_distance(x, y)       # pairwise distances
+st_area(x)              # polygon areas
+st_length(x)            # line lengths
+
+# Joins
+st_join(x, y)           # spatial left join (like dplyr::left_join, but by geometry)
+st_nearest_feature(x, y) # index of nearest feature in y for each x
+```
+
+::: {.callout-note}
+## For data journalists
+
+The spatial join (`st_join`) is your single most useful function. It lets you answer questions like: "Which district is this event in?", "How many incidents occurred in each neighborhood?", "Which schools are in the flood zone?" — all without manual matching or lookup tables.
+:::
+
+---
+
+# Part 4: Geocoding {#geocoding}
+
+Geocoding turns addresses or place names into coordinates. It's essential when your source data contains location names but no geometry — think lists of schools, hospitals, crime incidents, or... breweries.
+
+
+## Option 1: `tidygeocoder` (recommended for most use cases)
+
+`tidygeocoder` is a unified interface to multiple geocoding services. It works directly on data frames and integrates cleanly with the tidyverse. The **Nominatim** (OpenStreetMap) backend is free and requires no API key:
+
+```{r}
+#| eval: true
+#| label: tidygeocoder-demo
+
+library(tidygeocoder)
+
+# Geocode a few German cities
+cities <- tibble(
+  name = c("München", "Hamburg", "Köln", "Frankfurt am Main", "Stuttgart")
+)
+
+cities_geocoded <- cities |>
+  geocode(
+    address = name,
+    method = "osm"  # Nominatim / OpenStreetMap — free, no key needed
+  )
+
+cities_geocoded
+```
+
+The method parameter lets you switch between services. Here's what's available for free:
+
+```{r}
+#| label: tidygeocoder-services
+
+# Free services (no API key required):
+# method = "osm"        — Nominatim/OpenStreetMap. Best for international use.
+#                          Rate limit: 1 request/second.
+# method = "arcgis"     — ArcGIS. Good international coverage, no key for basic use.
+# method = "census"     — US Census. US addresses only.
+
+# Paid services (API key required, but often have free tiers):
+# method = "google"     — Google Maps. Excellent quality, $5/1000 requests.
+# method = "mapbox"     — Mapbox. 100k free requests/month.
+# method = "geocodio"   — Geocodio. 2,500 free/day. US & Canada only.
+# method = "here"       — HERE. 250k free requests/month.
+```
+
+::: {.callout-tip}
+## My recommendation
+
+For most data journalism projects, **Nominatim** (via `method = "osm"`) is the right starting point: it's free, requires no API key, and has good global coverage. Its main limitation is the rate limit (1 request/second), which makes it slow for large batches. For large-scale geocoding (10,000+ addresses), consider **ArcGIS** (also free, faster) or a paid service like **Mapbox** or **HERE**.
+:::
+
+
+## Option 2: `nominatimlite` (lightweight, sf-native)
+
+If you want geocoded results directly as `sf` objects (instead of lat/lon columns), `nominatimlite` is a nice lightweight option:
+
+```{r}
+#| eval: true
+#| label: nominatimlite-demo
+
+library(nominatimlite)
+
+# Geocode and get sf geometry directly
+munich_sf <- geo_lite_sf("München, Germany", limit = 1)
+munich_sf
+
+# Geocode multiple places
+brewery_cities <- c("Bamberg, Germany", "Kulmbach, Germany", "Bayreuth, Germany")
+brewery_cities_sf <- geo_lite_sf(brewery_cities, limit = 1)
+brewery_cities_sf
+```
+
+
+## Geocoding the brewery dataset
+
+In the `scraping-breweries.R` script, we geocoded brewery cities using the Nominatim API. Here's what that workflow looks like with `tidygeocoder` — a cleaner, more modern approach:
+
+```{r}
+#| label: geocode-breweries-modern
+
+# If you needed to re-geocode the brewery cities from scratch:
+# (Don't run this — it takes a while due to rate limits)
+
+# unique_cities <- unique(cities_from_scrape)
+#
+# geocoded <- tibble(city = unique_cities) |>
+#   geocode(
+#     address = city,
+#     method = "osm",
+#     custom_query = list(countrycodes = "de")  # restrict to Germany
+#   )
+```
+
+::: {.callout-important}
+## Geocoding gotchas
+
+1. **Ambiguity.** "Frankfurt" could be Frankfurt am Main or Frankfurt an der Oder. Always add country context (e.g., `countrycodes = "de"`).
+2. **Rate limits.** Nominatim allows 1 request/second. For 500+ cities, that's 8+ minutes. `tidygeocoder` handles rate limiting automatically.
+3. **Quality varies.** Geocoding works well for cities and street addresses, but poorly for vague locations ("near the old bridge"). Always sanity-check results on a map.
+4. **Cache your results.** Geocoding is slow and API-dependent. Save results to a file (`save()` or `write_csv()`) so you don't re-geocode every time.
+:::
+
+
+## Reverse geocoding
+
+Sometimes you have coordinates and need addresses — that's reverse geocoding:
+
+```{r}
+#| eval: true
+#| label: reverse-geocode
+
+# What's at these coordinates?
+coords <- tibble(
+  lat = c(52.5200, 48.1351, 50.1109),
+  lon = c(13.4050, 11.5820, 8.6821)
+)
+
+coords |>
+  reverse_geocode(
+    lat = lat, long = lon,
+    method = "osm",
+    address = "address_found"
+  )
+```
+
+Reverse geocoding is useful when you have GPS traces, satellite data, or geotagged photos and need to identify the location in human terms.
+
+---
+
+# Part 5: Plotting Maps {#plotting}
+
+Map design matters in data journalism — a well-crafted map can reveal patterns that tables and bar charts can't, but a bad map can mislead. This section covers practical map-making in R with an eye toward journalistic standards.
+
+
+## The basic recipe: `ggplot2` + `geom_sf()`
+
+Since `sf` objects are data frames, they plug directly into `ggplot2` via `geom_sf()`. This is the single most important thing to know about mapping in R:
+
+```{r}
+#| eval: true
+#| label: basic-map
+#| fig-height: 6
+
+ggplot() +
+  geom_sf(data = germany_states, fill = "gray95", color = "gray40") +
+  geom_sf(data = breweries_sf, color = "#C2001A", size = 0.3, alpha = 0.4) +
+  theme_void(base_size = 14) +
+  labs(
+    title = "Breweries in Germany",
+    caption = "Source: biermap24.de"
+  )
+```
+
+Already not bad. But let's make it better.
+
+
+## Choropleth maps: encoding data in color
+
+The most common journalistic map type. The key decisions are: what variable to show, which color scale, and how to bin the data.
+
+```{r}
+#| eval: true
+#| label: choropleth-polished
+#| fig-height: 6
+
+# Calculate brewery density (per 100k population would be better,
+# but we'll use per state for now)
+states_map <- states_with_breweries |>
+  mutate(n_breweries = replace_na(n_breweries, 0))
+
+ggplot(states_map) +
+  geom_sf(aes(fill = n_breweries), color = "white", linewidth = 0.3) +
+  scale_fill_distiller(
+    palette = "YlOrRd",
+    direction = 1,
+    name = "Number of\nbreweries",
+    breaks = c(0, 50, 100, 200, 400, 600)
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = c(0.15, 0.5),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray40")
+  ) +
+  labs(
+    title = "Germany's brewery landscape",
+    subtitle = "Bavaria dominates with more than half of all breweries",
+    caption = "Source: biermap24.de"
+  )
+```
+
+::: {.callout-warning}
+## The choropleth trap
+
+Choropleth maps encode data by *area*, which means large but sparsely populated regions dominate visually. A map of "total breweries per state" will be dominated by Bavaria partly because Bavaria is *big*. Always consider normalizing: breweries per capita, per km², or using a different map type entirely.
+:::
+
+
+## Dot density maps: showing individual locations
+
+When you have point data, showing the actual points is often more honest than aggregating into choropleth bins:
+
+```{r}
+#| eval: true
+#| label: dot-density
+#| fig-height: 6
+
+ggplot() +
+  geom_sf(data = germany_states, fill = "#f5f5f0", color = "gray70",
+          linewidth = 0.2) +
+  geom_sf(data = breweries_sf, color = "#C2001A", size = 0.15,
+          alpha = 0.35) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  labs(
+    title = "Every brewery in Germany",
+    subtitle = "Each dot = one brewery. The Franconian cluster is clearly visible.",
+    caption = "Source: biermap24.de"
+  )
+```
+
+This is the approach used in the slide image. The clustering in Franconia (northern Bavaria) is immediately obvious — something a choropleth at the state level would hide.
+
+
+## Combining layers: points + polygons + labels
+
+Journalistic maps often combine multiple layers. Let's highlight Bavaria and add context:
+
+```{r}
+#| eval: true
+#| label: layered-map
+#| fig-height: 6
+
+# Isolate Bavaria
+bavaria <- germany_states |> filter(name == "Bayern")
+
+# Major cities for context
+major_cities <- tibble(
+  name = c("München", "Berlin", "Hamburg", "Bamberg", "Nürnberg"),
+  lon = c(11.58, 13.41, 9.99, 10.89, 11.08),
+  lat = c(48.14, 52.52, 53.55, 49.89, 49.45)
+) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+ggplot() +
+  # Base: all states in light gray
+  geom_sf(data = germany_states, fill = "#f0f0f0", color = "gray70",
+          linewidth = 0.2) +
+  # Highlight Bavaria
+  geom_sf(data = bavaria, fill = "#FFF3CD", color = "#B8860B",
+          linewidth = 0.4) +
+  # All breweries
+  geom_sf(data = breweries_sf, color = "#C2001A", size = 0.15,
+          alpha = 0.35) +
+  # Major cities as labeled points
+  geom_sf(data = major_cities, color = "black", size = 2, shape = 21,
+          fill = "white") +
+  ggrepel::geom_text_repel(
+    data = major_cities |> mutate(
+      lon = st_coordinates(major_cities)[, 1],
+      lat = st_coordinates(major_cities)[, 2]
+    ),
+    aes(x = lon, y = lat, label = name),
+    size = 3.2, fontface = "bold",
+    nudge_y = 0.3, segment.size = 0.3
+  ) +
+  theme_void(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16)) +
+  labs(
+    title = "Germany's breweries cluster in Bavaria and Franconia",
+    caption = "Source: biermap24.de"
+  )
+```
+
+
+## Best practices for journalistic maps
+
+Here are concrete guidelines drawn from data journalism practice:
+
+**1. Choose the right map type for the story.**
+Point maps for discrete events (crimes, businesses, incidents). Choropleth maps for rates or aggregated data (unemployment rate, vote share). Avoid choropleths for raw counts — normalize first.
+
+**2. Use sequential color scales for quantitative data.**
+Single-hue scales (e.g., light to dark blue) work for "more vs. less." Diverging scales (e.g., blue–white–red) work when there's a meaningful midpoint (e.g., above/below average). Never use rainbow scales — they have no perceptual ordering.
+
+**3. Keep it minimal.**
+Strip away grid lines, axis labels, and unnecessary borders. Use `theme_void()` as your starting point. Add labels only where they serve the reader.
+
+**4. Mind the visual area bias.**
+Large regions attract attention regardless of their data values. Consider alternatives like cartograms, hex maps, or dot density maps when geographic area could mislead.
+
+**5. Show your sources.**
+Always include a data source caption. If the boundaries come from a specific year or administrative revision, say so.
+
+**6. Consider interactivity.**
+For web publication, `leaflet` or `mapview` let readers zoom and click. But a well-designed static map is often better for print and social sharing:
+
+```{r}
+#| label: interactive-map
+
+library(leaflet)
+
+# Quick interactive map
+leaflet(breweries) |>
+  addTiles() |>
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    radius = 2, color = "#C2001A",
+    fillOpacity = 0.4, stroke = FALSE,
+    popup = ~city
+  )
+```
+
+
+## Hex bin maps: handling overplotting
+
+When you have thousands of points, individual dots overlap. Hex bins aggregate into a grid while preserving the spatial pattern:
+
+```{r}
+#| eval: true
+#| label: hexbin-map
+#| fig-height: 6
+
+ggplot() +
+  geom_sf(data = germany, fill = NA, color = "gray40") +
+  geom_hex(
+    data = breweries,
+    aes(x = lon, y = lat),
+    bins = 30, alpha = 0.85
+  ) +
+  scale_fill_viridis_c(
+    option = "inferno",
+    direction = -1,
+    name = "Breweries\nper hex"
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = c(0.15, 0.4)
+  ) +
+  labs(
+    title = "Brewery density across Germany",
+    subtitle = "Hexagonal bins aggregate point locations into a density surface",
+    caption = "Source: biermap24.de"
+  )
+```
+
+---
+
+# Exercises {#exercises}
+
+::: {.callout-note}
+## Exercise 1: Brewery density per state
+
+Calculate the **brewery density** (breweries per 1,000 km²) for each German state and create a choropleth map. Hint: use `st_area()` to get state areas. Which state has the highest density? Is it still Bavaria?
+:::
+
+::: {.callout-note}
+## Exercise 2: Geocode and map
+
+Pick 5–10 addresses of interest to you (e.g., Hertie School, Bundestag, your favorite restaurants) and geocode them using `tidygeocoder`. Plot them on a map of Berlin using `geom_sf()`. Bonus: add 1 km buffers around each point.
+:::
+
+::: {.callout-note}
+## Exercise 3: Spatial filter
+
+Using the brewery data, find all breweries within 100 km of Bamberg (the unofficial capital of Franconian beer). How many are there? Create a map showing the buffer and the breweries inside it.
+:::
+
+::: {.callout-note}
+## Exercise 4: Critique a map
+
+Find a map from a recent news article. Does it use an appropriate map type? Is the color scale honest? Could the geographic area bias be misleading? Write a short (3–4 sentence) critique.
+:::
+
+---
+
+# Further reading
+
+- Pebesma, E. & Bivand, R. (2023). [*Spatial Data Science: With Applications in R*](https://r-spatial.org/book/) — the definitive reference for `sf` and spatial analysis in R.
+- Wilke, C.O. (2019). [*Fundamentals of Data Visualization*](https://clauswilke.com/dataviz/), Chapter 15: Visualizing geospatial data.
+- Lovelace, R., Nowosad, J. & Muenchow, J. (2024). [*Geocomputation with R*](https://r.geocompx.org/) — more applied, great for geospatial workflows.
+- The `tidygeocoder` [documentation](https://jessecambon.github.io/tidygeocoder/) for geocoding service details.
+
+---
+
+::: {.callout-note collapse="true"}
+## Session info
+
+```{r}
+#| eval: true
+sessionInfo()
+```
+:::

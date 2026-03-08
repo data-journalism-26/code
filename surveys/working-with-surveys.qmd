@@ -195,7 +195,7 @@ cat("True value:", round(true_support, 3), "\n")
 cat("Bias:", round(mean(biased_sample$support) - true_support, 3), "\n")
 ```
 
-Despite a large sample, the biased estimate is far from the truth — **this is the big data paradox in action**.
+Despite a large sample, the biased estimate is far from the truth. 
 
 ## The big data paradox: sample size vs. bias
 
