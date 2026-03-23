@@ -1,0 +1,332 @@
+# =============================================================================
+# Part 5: Plotting Maps
+# Working with Geodata in R — E1493 Data Journalism, Simon Munzert
+# =============================================================================
+
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggrepel)
+library(patchwork)
+library(hexbin)
+library(ggspatial)
+library(prettymapr)
+library(ggimage)
+library(leaflet)
+
+# Re-create base objects (or source parts 1–3 first)
+germany        <- ne_countries(scale = "medium", country = "Germany", returnclass = "sf")
+germany_states <- ne_states(country = "Germany", returnclass = "sf") |>
+  mutate(area_km2 = as.numeric(st_area(geometry) / 1e6))
+
+load("data/coords_breweries.RData")
+breweries <- coords_df |>
+  filter(!is.na(lon), !is.na(lat), lon >= 5.5, lon <= 15.5, lat >= 47, lat <= 55.5)
+breweries_sf <- st_as_sf(breweries, coords = c("lon", "lat"), crs = 4326)
+
+breweries_with_state <- st_join(breweries_sf, germany_states["name"])
+breweries_per_state  <- breweries_with_state |>
+  st_drop_geometry() |>
+  count(name, sort = TRUE) |>
+  rename(state = name, n_breweries = n)
+states_with_breweries <- germany_states |>
+  left_join(breweries_per_state, by = c("name" = "state")) |>
+  mutate(n_breweries = replace_na(n_breweries, 0))
+
+
+# -----------------------------------------------------------------------------
+# Basic recipe: ggplot2 + geom_sf()
+# -----------------------------------------------------------------------------
+
+ggplot() +
+  geom_sf(data = st_transform(germany_states, 25832),
+          fill = "gray95", color = "gray40") +
+  geom_sf(data = st_transform(breweries_sf, 25832),
+          color = "#C2001A", size = 0.3, alpha = 0.4) +
+  coord_sf(crs = 25832) +
+  theme_void(base_size = 14) +
+  labs(
+    title = "Breweries in Germany",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Choropleth map with discretised bins, bottom-centred legend
+# -----------------------------------------------------------------------------
+
+states_map <- states_with_breweries |>
+  mutate(
+    n_breweries = replace_na(n_breweries, 0),
+    brewery_bin = cut(
+      n_breweries,
+      breaks = c(-Inf, 10, 50, 100, 200, Inf),
+      labels = c("0\u201310", "11\u201350", "51\u2013100", "101\u2013200", "201+"),
+      right = TRUE
+    )
+  )
+
+ggplot(states_map) +
+  geom_sf(aes(fill = brewery_bin), color = "white", linewidth = 0.3) +
+  scale_fill_brewer(
+    palette = "YlOrRd",
+    name = "Number of\nbreweries",
+    na.value = "gray90"
+  ) +
+  guides(fill = guide_legend(nrow = 1, title.position = "top")) +
+  coord_sf(crs = 25832) +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray40")
+  ) +
+  labs(
+    title = "Germany's brewery landscape",
+    subtitle = "Bavaria dominates with more than half of all breweries",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Kernel density heatmap
+# -----------------------------------------------------------------------------
+
+ggplot() +
+  geom_sf(data = germany_states, fill = "#f5f5f0", color = "gray70",
+          linewidth = 0.2) +
+  stat_density_2d(
+    data = breweries,
+    aes(x = lon, y = lat, fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.7,
+    bins = 10,
+    h = c(1.2, 1.2)
+  ) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    name = "Density"
+  ) +
+  coord_sf(crs = 4326, xlim = c(5.5, 15.5), ylim = c(47, 55.5)) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  labs(
+    title = "Brewery density across Germany",
+    subtitle = "Kernel density estimate \u2014 darker = higher concentration of breweries",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Combining layers: points + polygons + labels
+# ggrepel needs projected x/y as a plain data frame — NOT an sf geometry column.
+# nudge_y is in metres (UTM 25832), not degrees.
+# -----------------------------------------------------------------------------
+
+bavaria <- germany_states |> filter(name == "Bayern")
+
+major_cities <- tibble(
+  name = c("M\u00fcnchen", "Berlin", "Hamburg", "Bamberg", "N\u00fcrnberg"),
+  lon  = c(11.58, 13.41, 9.99, 10.89, 11.08),
+  lat  = c(48.14, 52.52, 53.55, 49.89, 49.45)
+) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# Extract projected coordinates as a plain data frame for geom_text_repel
+major_cities_coords <- major_cities |>
+  st_transform(25832) |>
+  mutate(
+    x = st_coordinates(geometry)[, 1],
+    y = st_coordinates(geometry)[, 2]
+  ) |>
+  st_drop_geometry()
+
+ggplot() +
+  geom_sf(data = germany_states, fill = "#f0f0f0", color = "gray70",
+          linewidth = 0.2) +
+  geom_sf(data = bavaria, fill = "#FFF3CD", color = "#B8860B",
+          linewidth = 0.4) +
+  geom_sf(data = breweries_sf, color = "#C2001A", size = 0.15,
+          alpha = 0.35) +
+  geom_sf(data = major_cities, color = "black", size = 2, shape = 21,
+          fill = "white") +
+  ggrepel::geom_text_repel(
+    data = major_cities_coords,
+    aes(x = x, y = y, label = name),
+    size = 3.2, fontface = "bold",
+    nudge_y = 50000, segment.size = 0.3
+  ) +
+  coord_sf(crs = 25832) +
+  theme_void(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16)) +
+  labs(
+    title = "Germany's breweries cluster in Bavaria and Franconia",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Hex bin map
+# geom_hex + coord_sf conflict: project first, extract plain x/y coords,
+# then use coord_sf(crs = 25832) for axis labels only.
+# -----------------------------------------------------------------------------
+
+breweries_proj <- st_transform(breweries_sf, 25832)
+brew_xy        <- as.data.frame(st_coordinates(breweries_proj))
+germany_proj   <- st_transform(germany, 25832)
+
+ggplot() +
+  geom_sf(data = germany_proj, fill = NA, color = "gray40") +
+  geom_hex(
+    data = brew_xy,
+    aes(x = X, y = Y),
+    bins = 30, alpha = 0.85
+  ) +
+  scale_fill_viridis_c(
+    option = "inferno",
+    direction = -1,
+    name = "Breweries\nper hex"
+  ) +
+  coord_sf(crs = 25832) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = c(0.15, 0.4)
+  ) +
+  labs(
+    title = "Brewery density across Germany",
+    subtitle = "Hexagonal bins aggregate point locations into a density surface",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Topographic elevation backdrop
+# Requires internet access + install.packages(c("elevatr", "tidyterra"))
+# Downloading elevation data may take 30-60 seconds.
+# -----------------------------------------------------------------------------
+
+library(elevatr)
+library(tidyterra)
+library(terra)
+
+bavaria_wgs84 <- germany_states |>
+  filter(name == "Bayern") |>
+  st_transform(4326)
+
+# z = 7 gives ~1 km resolution
+bavaria_elev        <- get_elev_raster(bavaria_wgs84, z = 7, clip = "bbox")
+bavaria_elev_terra  <- rast(bavaria_elev)
+bavaria_elev_masked <- mask(bavaria_elev_terra, vect(bavaria_wgs84))
+
+breweries_bavaria <- st_intersection(
+  st_transform(breweries_sf, 4326),
+  bavaria_wgs84
+)
+
+ggplot() +
+  tidyterra::geom_spatraster(data = bavaria_elev_masked) +
+  scale_fill_hypso_c(
+    palette = "dem_screen",
+    na.value = NA,
+    name = "Elevation (m)"
+  ) +
+  geom_sf(data = bavaria_wgs84, fill = NA, color = "gray30", linewidth = 0.4) +
+  geom_sf(data = breweries_bavaria, color = "#C2001A", size = 0.6, alpha = 0.6) +
+  theme_void(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16)) +
+  labs(
+    title = "Breweries in Bavaria against an elevation backdrop",
+    subtitle = "Most Franconian breweries sit in the relatively flat northern part of Bavaria",
+    caption = "Elevation: elevatr / Amazon Web Services Terrain Tiles | Breweries: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Hybrid map with OSM tile basemap
+# Requires internet access + install.packages(c("ggspatial", "prettymapr"))
+# -----------------------------------------------------------------------------
+
+breweries_franconia <- breweries |>
+  filter(lon >= 9.5, lon <= 12.5, lat >= 49.0, lat <= 51.0)
+
+ggplot() +
+  annotation_map_tile(type = "osm", zoom = 8) +
+  geom_point(
+    data = breweries_franconia,
+    aes(x = lon, y = lat),
+    color = "#C2001A", size = 1.2, alpha = 0.7
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(
+    location = "tr",
+    style = north_arrow_fancy_orienteering()
+  ) +
+  coord_sf(crs = 4326, xlim = c(9.5, 12.5), ylim = c(49.0, 51.0)) +
+  theme_void(base_size = 13) +
+  labs(
+    title = "Breweries in Franconia",
+    subtitle = "OpenStreetMap tile basemap with scale bar and north arrow",
+    caption = "Tiles: \u00a9 OpenStreetMap contributors | Breweries: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Beer icon map — uses a local PNG file (data/beermug.png)
+# Requires install.packages("ggimage")
+# -----------------------------------------------------------------------------
+
+set.seed(42)
+breweries_sample <- breweries |>
+  slice_sample(n = 150) |>
+  mutate(icon = "data/beermug.png")
+
+ggplot() +
+  geom_sf(data = germany_states, fill = "#f5f5f0", color = "gray70",
+          linewidth = 0.2) +
+  geom_image(
+    data = breweries_sample,
+    aes(x = lon, y = lat, image = icon),
+    size = 0.025
+  ) +
+  coord_sf(crs = 4326, xlim = c(5.5, 15.5), ylim = c(47, 55.5)) +
+  theme_void(base_size = 14) +
+  labs(
+    title = "150 randomly sampled German breweries",
+    caption = "Source: biermap24.de"
+  )
+
+
+# -----------------------------------------------------------------------------
+# Interactive leaflet map
+# Run interactively — produces an HTML widget in the RStudio Viewer pane.
+# -----------------------------------------------------------------------------
+
+leaflet(breweries) |>
+  setView(lng = 10.5, lat = 51.2, zoom = 6) |>
+  addProviderTiles("CartoDB.Positron",  group = "CartoDB Positron") |>
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") |>
+  addProviderTiles("OpenStreetMap",     group = "OpenStreetMap") |>
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    radius = 4,
+    color = "#C2001A",
+    fillOpacity = 0.7,
+    stroke = FALSE,
+    popup = ~city,
+    group = "Breweries",
+    clusterOptions = markerClusterOptions()
+  ) |>
+  addLayersControl(
+    baseGroups    = c("CartoDB Positron", "Satellite", "OpenStreetMap"),
+    overlayGroups = "Breweries",
+    options       = layersControlOptions(collapsed = FALSE)
+  ) |>
+  addMiniMap(toggleDisplay = TRUE) |>
+  addScaleBar(position = "bottomright")
